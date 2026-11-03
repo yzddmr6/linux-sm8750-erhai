@@ -3,8 +3,8 @@
 #ifndef __QCOM_BATTMGR_PPS_H
 #define __QCOM_BATTMGR_PPS_H
 
-#define OPD_PPS_MAX_MA		3000
-#define OPD_PPS_MAX_MW		33000
+#define OPD_PPS_MAX_MA		4500
+#define OPD_PPS_MAX_MW		38000
 #define OPD_PPS_IBAT_MAX_MA	7400
 #define OPD_PPS_SOFT_FULL_MV	4490
 #define OPD_PPS_HARD_FULL_MV	4540
@@ -14,6 +14,13 @@
 /* Stock 10 V VBUS OVP, less the vendor servo's 500 mV headroom. */
 #define OPD_PPS_MAX_MV		9500
 #define OPD_PPS_POLL_MS		500
+/*
+ * Let the curve forget transients. The track only ever descends, so one
+ * sampling spike on the pack node would otherwise pin the whole session
+ * to a lower current band. 20 mV per poll is far slower than real cell
+ * rise (tens of mV per minute) and far faster than a switching spike.
+ */
+#define OPD_PPS_PEAK_DECAY_MV	20
 #define OPD_PPS_START_DELAY_MS	500
 #define OPD_PPS_TIMEOUT_S	30188
 #define OPD_PPS_SLAVE_ON_MA	1900
@@ -35,23 +42,23 @@ struct opd_pps_point {
 /* All six SOC bands and seven temperature bands of the third-party curve. */
 static const struct opd_pps_point opd_pps_curves[][6] = {
 	{
-		{ 4150, 3000 }, { 4480, 2650 }, { 4480, 2500 },
+		{ 4150, 3800 }, { 4480, 2650 }, { 4480, 2500 },
 		{ 4480, 2000 }, { 4480, 1500 }, { 4490, 1000 }
 	},
 	{
-		{ 4150, 3000 }, { 4200, 2950 }, { 4480, 2500 },
+		{ 4150, 3800 }, { 4200, 2950 }, { 4480, 2500 },
 		{ 4480, 2000 }, { 4480, 1500 }, { 4490, 1000 }
 	},
 	{
-		{ 4380, 3000 }, { 4480, 2950 }, { 4480, 2500 },
+		{ 4380, 3800 }, { 4480, 2950 }, { 4480, 2500 },
 		{ 4480, 2000 }, { 4480, 1500 }, { 4490, 1000 }
 	},
 	{
-		{ 4380, 3000 }, { 4460, 2950 }, { 4460, 2500 },
+		{ 4380, 3800 }, { 4460, 2950 }, { 4460, 2500 },
 		{ 4460, 2000 }, { 4460, 1500 }, { 4470, 1000 }
 	},
 	{
-		{ 4120, 3000 }, { 4120, 2500 }, { 4120, 2000 }, { 4120, 1500 }, { 4130, 1000 }
+		{ 4120, 3800 }, { 4120, 2500 }, { 4120, 2000 }, { 4120, 1500 }, { 4130, 1000 }
 	},
 	{ { 4480, 2000 }, { 4480, 1500 }, { 4490, 1000 } },
 	{ { 4480, 2500 }, { 4480, 2000 }, { 4480, 1500 }, { 4490, 1000 } },

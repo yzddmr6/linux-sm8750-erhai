@@ -1417,8 +1417,16 @@ static unsigned int qcom_battmgr_pps_update(struct qcom_battmgr *battmgr)
 	if (ret)
 		goto failed;
 	if (icl) {
-		ret = -EBUSY;
-		goto failed;
+		/*
+		 * The firmware re-arms the buck input limit on every PD contract
+		 * change, so a PPS session finds it non-zero again. Zero it and
+		 * carry on instead of aborting the session.
+		 */
+		dev_dbg(battmgr->dev, "PPS: input limit re-armed to %u mA, clearing\n", icl);
+		ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+						USB_INPUT_CURR_LIMIT, 0);
+		if (ret)
+			goto failed;
 	}
 	ret = qcom_battmgr_pps_sample(battmgr, &s);
 	if (ret)
@@ -1438,8 +1446,10 @@ static unsigned int qcom_battmgr_pps_update(struct qcom_battmgr *battmgr)
 			     max(cp[0].vbus_mv, cp[1].vbus_mv), ibus,
 			     qcom_battmgr_pps_soc_max(battmgr));
 	if (exit != OPD_PPS_OK) {
-		dev_warn(battmgr->dev, "PPS: protection %u, SOC %d, temp %d, VBAT %d, IBAT %d\n",
-			 exit, s.soc, s.temp, vbat, s.ibat_ma);
+		dev_warn(battmgr->dev,
+			 "PPS: protection %u, SOC %d, temp %d, VBUS %d, VBAT %d, IBUS %d, IBAT %d\n",
+			 exit, s.soc, s.temp, max(cp[0].vbus_mv, cp[1].vbus_mv), vbat, ibus,
+			 s.ibat_ma);
 		qcom_battmgr_pps_stop(battmgr, PPS_HOLD, "protection limit");
 		return 0;
 	}
@@ -1449,13 +1459,22 @@ static unsigned int qcom_battmgr_pps_update(struct qcom_battmgr *battmgr)
 			goto failed;
 		battmgr->pps_max_ma = min(battmgr->pps_max_ma, ret);
 	}
-	battmgr->pps_peak_vbat = max(battmgr->pps_peak_vbat, vbat);
+	battmgr->pps_peak_vbat = max(battmgr->pps_peak_vbat - OPD_PPS_PEAK_DECAY_MV,
+				     vbat);
 	ma = opd_pps_current(s.soc, s.temp, battmgr->pps_peak_vbat,
 			     battmgr->pps_max_ma, battmgr->pps_ceiling_ma);
 	if (!ma) {
 		qcom_battmgr_pps_stop(battmgr, PPS_HOLD, "curve complete");
 		return 0;
 	}
+	/*
+	 * The curve is keyed on SOC and pack voltage, so it cannot follow the
+	 * rising charge-pump gain as the pack fills. Trim the request before the
+	 * battery current reaches its hard ceiling: hitting it stops the session
+	 * outright and the hold never retries.
+	 */
+	if (s.ibat_ma >= OPD_PPS_IBAT_MAX_MA - 100)
+		ma = max_t(int, ma - 100, OPD_PPS_START_MA);
 	battmgr->pps_ceiling_ma = ma;
 
 	if (battmgr->pps_state == PPS_RAMP) {
