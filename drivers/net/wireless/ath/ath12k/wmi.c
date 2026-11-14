@@ -7551,6 +7551,10 @@ static void ath12k_scan_event(struct ath12k_base *ab, struct sk_buff *skb)
 		ath12k_wmi_event_scan_started(ar);
 		break;
 	case WMI_SCAN_EVENT_COMPLETED:
+		if (ar->scan.range_req &&
+		    ar->scan.state == ATH12K_SCAN_RUNNING &&
+		    le32_to_cpu(scan_ev.reason) != WMI_SCAN_REASON_COMPLETED)
+			ar->scan.state = ATH12K_SCAN_ABORTING;
 		ath12k_wmi_event_scan_completed(ar);
 		break;
 	case WMI_SCAN_EVENT_BSS_CHANNEL:
@@ -7564,6 +7568,9 @@ static void ath12k_scan_event(struct ath12k_base *ab, struct sk_buff *skb)
 		ath12k_wmi_event_scan_start_failed(ar);
 		break;
 	case WMI_SCAN_EVENT_DEQUEUED:
+		if (ar->scan.range_req &&
+		    ar->scan.state == ATH12K_SCAN_RUNNING)
+			ar->scan.state = ATH12K_SCAN_ABORTING;
 		__ath12k_mac_scan_finish(ar);
 		break;
 	case WMI_SCAN_EVENT_PREEMPTED:
