@@ -254,6 +254,12 @@ const struct htt_rx_ring_tlv_filter ath12k_mac_mon_status_filter_default = {
 #define ath12k_a_rates_size (ARRAY_SIZE(ath12k_legacy_rates) - 4)
 
 #define ATH12K_MAC_SCAN_TIMEOUT_MSECS 200 /* in msecs */
+/* WCN7860 dequeues a finished multi-channel range only after the next start
+ * command, about a second later; the one-channel associated batches start
+ * back to back.
+ */
+#define ATH12K_RANGE_START_TIMEOUT (3 * HZ)
+#define ATH12K_RANGE_START_SLACK_MSECS 2000
 
 static const u32 ath12k_smps_map[] = {
 	[WLAN_HT_CAP_SM_PS_STATIC] = WMI_PEER_SMPS_STATIC,
@@ -5246,7 +5252,8 @@ ath12k_mac_select_scan_device(struct ieee80211_hw *hw,
 }
 
 static int ath12k_start_scan(struct ath12k *ar,
-			     struct ath12k_wmi_scan_req_arg *arg);
+			     struct ath12k_wmi_scan_req_arg *arg,
+			     unsigned long timeout);
 
 static u32 ath12k_mac_scan_split_freq(struct ath12k *ar)
 {
@@ -5314,6 +5321,23 @@ static u32 ath12k_mac_scan_range_count(const u32 *freqs, u32 n_freqs,
 	}
 
 	return i;
+}
+
+static u32 ath12k_mac_scan_range_batches(const u32 *freqs, u32 n_freqs,
+					 u32 split_freq)
+{
+	u32 batches = 1, i;
+
+	if (!split_freq || !n_freqs)
+		return 1;
+
+	for (i = 1; i < n_freqs; i++) {
+		if (ath12k_mac_scan_range_class(freqs[i], split_freq) !=
+		    ath12k_mac_scan_range_class(freqs[i - 1], split_freq))
+			batches++;
+	}
+
+	return batches;
 }
 
 static void ath12k_mac_scan_range_tx_resume(struct ath12k *ar)
@@ -5418,7 +5442,8 @@ static int ath12k_mac_scan_range_start(struct ath12k *ar)
 
 	ret = ath12k_mac_scan_range_tx_pause(ar);
 	if (!ret) {
-		ret = ath12k_start_scan(ar, part);
+		ret = ath12k_start_scan(ar, part,
+					ATH12K_RANGE_START_TIMEOUT);
 		if (ret)
 			ath12k_mac_scan_range_tx_resume(ar);
 	}
@@ -5684,7 +5709,8 @@ work_complete:
 }
 
 static int ath12k_start_scan(struct ath12k *ar,
-			     struct ath12k_wmi_scan_req_arg *arg)
+			     struct ath12k_wmi_scan_req_arg *arg,
+			     unsigned long timeout)
 {
 	int ret;
 
@@ -5694,7 +5720,7 @@ static int ath12k_start_scan(struct ath12k *ar,
 	if (ret)
 		return ret;
 
-	ret = wait_for_completion_timeout(&ar->scan.started, 1 * HZ);
+	ret = wait_for_completion_timeout(&ar->scan.started, timeout);
 	if (ret == 0) {
 		ret = ath12k_scan_stop(ar);
 		if (ret)
@@ -6024,6 +6050,16 @@ static int ath12k_mac_initiate_hw_scan(struct ieee80211_hw *hw,
 	if (split_scan && arvif->is_up)
 		max_scan_time += 2 * arg->min_rest_time * arg->num_chan;
 
+	/* Only an unassociated multi-channel batch is dequeued late; the
+	 * one-channel associated batches are accepted back to back.
+	 */
+	if (split_scan && !arvif->is_up)
+		max_scan_time +=
+			ath12k_mac_scan_range_batches(arg->chan_list,
+						      arg->num_chan,
+						      split_freq) *
+			ATH12K_RANGE_START_SLACK_MSECS;
+
 	if (split_scan) {
 		spin_lock_bh(&ar->data_lock);
 		ar->scan.range_req = arg;
@@ -6037,7 +6073,7 @@ static int ath12k_mac_initiate_hw_scan(struct ieee80211_hw *hw,
 		arg = NULL;
 		ret = ath12k_mac_scan_range_start(ar);
 	} else {
-		ret = ath12k_start_scan(ar, arg);
+		ret = ath12k_start_scan(ar, arg, 1 * HZ);
 	}
 	if (ret) {
 		if (ret == -EBUSY)
@@ -14394,7 +14430,7 @@ int ath12k_mac_op_remain_on_channel(struct ieee80211_hw *hw,
 	arg->scan_f_passive = 1;
 	arg->burst_duration = duration;
 
-	ret = ath12k_start_scan(ar, arg);
+	ret = ath12k_start_scan(ar, arg, 1 * HZ);
 	if (ret) {
 		ath12k_warn(ar->ab, "failed to start roc scan: %d\n", ret);
 
