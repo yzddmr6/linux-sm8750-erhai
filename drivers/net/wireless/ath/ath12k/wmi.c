@@ -7551,6 +7551,10 @@ static void ath12k_scan_event(struct ath12k_base *ab, struct sk_buff *skb)
 		ath12k_wmi_event_scan_started(ar);
 		break;
 	case WMI_SCAN_EVENT_COMPLETED:
+		if (ar->scan.range_req &&
+		    ar->scan.state == ATH12K_SCAN_RUNNING &&
+		    le32_to_cpu(scan_ev.reason) != WMI_SCAN_REASON_COMPLETED)
+			ar->scan.state = ATH12K_SCAN_ABORTING;
 		ath12k_wmi_event_scan_completed(ar);
 		break;
 	case WMI_SCAN_EVENT_BSS_CHANNEL:
@@ -7564,6 +7568,15 @@ static void ath12k_scan_event(struct ath12k_base *ab, struct sk_buff *skb)
 		ath12k_wmi_event_scan_start_failed(ar);
 		break;
 	case WMI_SCAN_EVENT_DEQUEUED:
+		/* A range batch dequeue arrives after the next start command
+		 * has been sent, while that start waits for its STARTED event.
+		 * It belongs to the previous batch and must not finish the new
+		 * one. An aborted range scan still needs the cleanup below.
+		 */
+		if (ar->scan.range_req &&
+		    (ar->scan.state == ATH12K_SCAN_STARTING ||
+		     ar->scan.state == ATH12K_SCAN_RUNNING))
+			break;
 		__ath12k_mac_scan_finish(ar);
 		break;
 	case WMI_SCAN_EVENT_PREEMPTED:

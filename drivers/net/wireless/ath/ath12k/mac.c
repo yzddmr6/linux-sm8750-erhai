@@ -7,6 +7,8 @@
 #include <net/mac80211.h>
 #include <net/cfg80211.h>
 #include <linux/etherdevice.h>
+#include <linux/delay.h>
+#include <linux/of.h>
 
 #include "mac.h"
 #include "core.h"
@@ -252,6 +254,12 @@ const struct htt_rx_ring_tlv_filter ath12k_mac_mon_status_filter_default = {
 #define ath12k_a_rates_size (ARRAY_SIZE(ath12k_legacy_rates) - 4)
 
 #define ATH12K_MAC_SCAN_TIMEOUT_MSECS 200 /* in msecs */
+/* WCN7860 dequeues a finished multi-channel range only after the next start
+ * command, about a second later; the one-channel associated batches start
+ * back to back.
+ */
+#define ATH12K_RANGE_START_TIMEOUT (3 * HZ)
+#define ATH12K_RANGE_START_SLACK_MSECS 2000
 
 static const u32 ath12k_smps_map[] = {
 	[WLAN_HT_CAP_SM_PS_STATIC] = WMI_PEER_SMPS_STATIC,
@@ -5243,6 +5251,208 @@ ath12k_mac_select_scan_device(struct ieee80211_hw *hw,
 	return NULL;
 }
 
+static int ath12k_start_scan(struct ath12k *ar,
+			     struct ath12k_wmi_scan_req_arg *arg,
+			     unsigned long timeout);
+
+static u32 ath12k_mac_scan_split_freq(struct ath12k *ar)
+{
+	struct ath12k_base *ab = ar->ab;
+	u32 low[2] = { 0 }, high[2] = { 0 };
+	u32 boundary;
+	int i;
+
+	if (!of_machine_is_compatible("oneplus,erhai") &&
+	    !of_machine_is_compatible("oneplus,opd2413"))
+		return 0;
+
+	if (ab->hw_rev != ATH12K_HW_WCN7860_HW20 ||
+	    ab->num_radios != 1 || ar->ah->num_radio != 1 ||
+	    !ab->hw_params->single_pdev_only ||
+	    ab->wmi_ab.preferred_hw_mode != WMI_HOST_HW_MODE_DBS_OR_SBS)
+		return 0;
+
+	for (i = 0; i < ARRAY_SIZE(ab->wmi_ab.svc_ext_info.mac_phy_info); i++) {
+		struct ath12k_svc_ext_mac_phy_info *info =
+			&ab->wmi_ab.svc_ext_info.mac_phy_info[i];
+		u32 phy_id = info->phy_id;
+
+		if (info->hw_mode_config_type != WMI_HOST_HW_MODE_DBS_OR_SBS ||
+		    phy_id >= 2 ||
+		    !(info->supported_bands & WMI_HOST_WLAN_5GHZ_CAP))
+			continue;
+
+		low[phy_id] = info->hw_freq_range.low_5ghz_freq;
+		high[phy_id] = info->hw_freq_range.high_5ghz_freq;
+	}
+
+	if (!low[0] || !low[1] || low[0] >= high[0] || low[1] >= high[1] ||
+	    high[0] == high[1])
+		return 0;
+
+	boundary = min(high[0], high[1]);
+	if (boundary <= max(low[0], low[1]) || boundary >= 5925)
+		return 0;
+
+	return boundary;
+}
+
+static u32 ath12k_mac_scan_range_class(u32 freq, u32 split_freq)
+{
+	if (freq < 3000)
+		return 0;
+	if (freq < 5925)
+		return freq <= split_freq ? 1 : 2;
+	return 3;
+}
+
+static u32 ath12k_mac_scan_range_count(const u32 *freqs, u32 n_freqs,
+				       u32 split_freq)
+{
+	u32 cls, i;
+
+	if (!split_freq || !n_freqs)
+		return n_freqs;
+
+	cls = ath12k_mac_scan_range_class(freqs[0], split_freq);
+	for (i = 1; i < n_freqs; i++) {
+		if (ath12k_mac_scan_range_class(freqs[i], split_freq) != cls)
+			break;
+	}
+
+	return i;
+}
+
+static u32 ath12k_mac_scan_range_batches(const u32 *freqs, u32 n_freqs,
+					 u32 split_freq)
+{
+	u32 batches = 1, i;
+
+	if (!split_freq || !n_freqs)
+		return 1;
+
+	for (i = 1; i < n_freqs; i++) {
+		if (ath12k_mac_scan_range_class(freqs[i], split_freq) !=
+		    ath12k_mac_scan_range_class(freqs[i - 1], split_freq))
+			batches++;
+	}
+
+	return batches;
+}
+
+static void ath12k_mac_scan_range_tx_resume(struct ath12k *ar)
+{
+	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
+
+	if (!ar->scan.range_tx_paused)
+		return;
+
+	/* completion may precede firmware home-channel return */
+	msleep(ar->scan.range_req->min_rest_time);
+
+	ar->scan.range_tx_paused = false;
+	ieee80211_wake_queues(ath12k_ar_to_hw(ar));
+}
+
+static int ath12k_mac_scan_range_tx_pause(struct ath12k *ar)
+{
+	struct ieee80211_hw *hw = ath12k_ar_to_hw(ar);
+	long time_left;
+
+	lockdep_assert_wiphy(hw->wiphy);
+
+	if (!ar->scan.arvif->is_up)
+		return 0;
+
+	if (ieee80211_queue_stopped(hw, 0))
+		return -EBUSY;
+
+	ar->scan.range_tx_paused = true;
+	ieee80211_stop_queues(hw);
+	synchronize_net();
+
+	time_left = wait_event_timeout(ar->dp.tx_empty_waitq,
+				       atomic_read(&ar->dp.num_tx_pending) == 0,
+				       ATH12K_FLUSH_TIMEOUT);
+	if (!time_left) {
+		ath12k_mac_scan_range_tx_resume(ar);
+		return -ETIMEDOUT;
+	}
+
+	return 0;
+}
+
+static void ath12k_mac_scan_range_free(struct ath12k *ar)
+{
+	struct ath12k_wmi_scan_req_arg *req;
+
+	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
+
+	ath12k_mac_scan_range_tx_resume(ar);
+
+	spin_lock_bh(&ar->data_lock);
+	req = ar->scan.range_req;
+	ar->scan.range_req = NULL;
+	ar->scan.range_next = 0;
+	ar->scan.range_split_freq = 0;
+	spin_unlock_bh(&ar->data_lock);
+
+	if (!req)
+		return;
+
+	kfree(req->extraie.ptr);
+	kfree(req);
+}
+
+static int ath12k_mac_scan_range_start(struct ath12k *ar)
+{
+	struct ath12k_wmi_scan_req_arg *arg = ar->scan.range_req;
+	struct ath12k_wmi_scan_req_arg *part;
+	u32 next = ar->scan.range_next;
+	u32 n;
+	int ret;
+
+	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
+
+	if (!arg || next >= arg->num_chan)
+		return -EINVAL;
+
+	n = ath12k_mac_scan_range_count(arg->chan_list + next,
+					arg->num_chan - next,
+					ar->scan.range_split_freq);
+
+	/* Associated firmware batches need bounded off-channel time. */
+	if (ar->scan.arvif->is_up)
+		n = 1;
+
+	part = kzalloc_flex(*part, chan_list, n);
+	if (!part)
+		return -ENOMEM;
+
+	memcpy(part, arg, sizeof(*part));
+	part->num_chan = n;
+	memcpy(part->chan_list, arg->chan_list + next,
+	       n * sizeof(*part->chan_list));
+
+	ar->scan.range_next = next + n;
+
+	/* Firmware needs home-channel rest between associated batches. */
+	if (next && ar->scan.arvif->is_up)
+		msleep(arg->min_rest_time);
+
+	ret = ath12k_mac_scan_range_tx_pause(ar);
+	if (!ret) {
+		ret = ath12k_start_scan(ar, part,
+					ATH12K_RANGE_START_TIMEOUT);
+		if (ret)
+			ath12k_mac_scan_range_tx_resume(ar);
+	}
+
+	kfree(part);
+
+	return ret;
+}
+
 void __ath12k_mac_scan_finish(struct ath12k *ar)
 {
 	struct ieee80211_hw *hw = ath12k_ar_to_hw(ar);
@@ -5258,7 +5468,7 @@ void __ath12k_mac_scan_finish(struct ath12k *ar)
 			ieee80211_remain_on_channel_expired(hw);
 		fallthrough;
 	case ATH12K_SCAN_STARTING:
-		cancel_delayed_work(&ar->scan.timeout);
+		ar->scan.finish_queued = true;
 		complete_all(&ar->scan.completed);
 		wiphy_work_queue(ar->ah->hw->wiphy, &ar->scan.vdev_clean_wk);
 		break;
@@ -5268,6 +5478,8 @@ void __ath12k_mac_scan_finish(struct ath12k *ar)
 void ath12k_mac_scan_finish(struct ath12k *ar)
 {
 	spin_lock_bh(&ar->data_lock);
+	if (ar->scan.range_req && ar->scan.state != ATH12K_SCAN_IDLE)
+		ar->scan.state = ATH12K_SCAN_ABORTING;
 	__ath12k_mac_scan_finish(ar);
 	spin_unlock_bh(&ar->data_lock);
 }
@@ -5336,6 +5548,8 @@ static void ath12k_scan_abort(struct ath12k *ar)
 			    ar->scan.state);
 		break;
 	case ATH12K_SCAN_RUNNING:
+		if (ar->scan.finish_queued)
+			break;
 		ar->scan.state = ATH12K_SCAN_ABORTING;
 		spin_unlock_bh(&ar->data_lock);
 
@@ -5350,14 +5564,17 @@ static void ath12k_scan_abort(struct ath12k *ar)
 	spin_unlock_bh(&ar->data_lock);
 }
 
-static void ath12k_scan_timeout_work(struct work_struct *work)
+static void ath12k_scan_timeout_work(struct wiphy *wiphy,
+				     struct wiphy_work *work)
 {
-	struct ath12k *ar = container_of(work, struct ath12k,
-					 scan.timeout.work);
+	struct wiphy_delayed_work *dwork;
+	struct ath12k *ar;
 
-	wiphy_lock(ath12k_ar_to_hw(ar)->wiphy);
+	dwork = container_of(work, struct wiphy_delayed_work, work);
+	ar = container_of(dwork, struct ath12k, scan.timeout);
+	lockdep_assert_wiphy(wiphy);
+
 	ath12k_scan_abort(ar);
-	wiphy_unlock(ath12k_ar_to_hw(ar)->wiphy);
 }
 
 static void ath12k_mac_scan_send_complete(struct ath12k *ar,
@@ -5383,10 +5600,21 @@ static void ath12k_scan_vdev_clean_work(struct wiphy *wiphy, struct wiphy_work *
 					 scan.vdev_clean_wk);
 	struct ath12k_hw *ah = ar->ah;
 	struct ath12k_link_vif *arvif;
+	int ret;
 
 	lockdep_assert_wiphy(wiphy);
 
+	ath12k_mac_scan_range_tx_resume(ar);
+
 	arvif = ar->scan.arvif;
+
+	/* A range scan keeps one overall request timer across batches:
+	 * cancel it only for the last batch, a non-range scan or an abort.
+	 */
+	if (!ar->scan.range_req ||
+	    ar->scan.state == ATH12K_SCAN_ABORTING ||
+	    ar->scan.range_next >= ar->scan.range_req->num_chan)
+		wiphy_delayed_work_cancel(wiphy, &ar->scan.timeout);
 
 	/* The scan vdev has already been deleted. This can occur when a
 	 * new scan request is made on the same vif with a different
@@ -5395,7 +5623,47 @@ static void ath12k_scan_vdev_clean_work(struct wiphy *wiphy, struct wiphy_work *
 	 * arvif is already deleted. Alternatively, if the scan vdev is not
 	 * being used as an actual vdev, then do not delete it.
 	 */
-	if (!arvif || arvif->is_started)
+	if (!arvif)
+		goto work_complete;
+
+	/* Range scan: an intermediate batch finished. Keep the scan vdev and
+	 * the owned request and start the next range instead of tearing the
+	 * vdev down. The single overall request timer keeps running.
+	 */
+	if (ar->scan.range_req) {
+		bool start_next = false;
+
+		spin_lock_bh(&ar->data_lock);
+		if (ar->scan.range_req &&
+		    ar->scan.state == ATH12K_SCAN_RUNNING &&
+		    ar->scan.range_next < ar->scan.range_req->num_chan) {
+			reinit_completion(&ar->scan.started);
+			reinit_completion(&ar->scan.completed);
+			ar->scan.state = ATH12K_SCAN_STARTING;
+			ar->scan.finish_queued = false;
+			start_next = true;
+		}
+		spin_unlock_bh(&ar->data_lock);
+
+		if (start_next) {
+			ret = ath12k_mac_scan_range_start(ar);
+			if (!ret)
+				return;
+
+			ath12k_warn(ar->ab,
+				    "failed to start next scan range: %d\n",
+				    ret);
+
+			/* The start timeout may have re-queued this work. */
+			wiphy_work_cancel(wiphy, &ar->scan.vdev_clean_wk);
+
+			spin_lock_bh(&ar->data_lock);
+			ar->scan.state = ATH12K_SCAN_ABORTING;
+			spin_unlock_bh(&ar->data_lock);
+		}
+	}
+
+	if (arvif->is_started)
 		goto work_complete;
 
 	ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac clean scan vdev (link id %u)",
@@ -5405,6 +5673,21 @@ static void ath12k_scan_vdev_clean_work(struct wiphy *wiphy, struct wiphy_work *
 	ath12k_mac_unassign_link_vif(arvif);
 
 work_complete:
+	if (ar->scan.range_req) {
+		wiphy_delayed_work_cancel(wiphy, &ar->scan.timeout);
+
+		/* If the owned request still has unscanned channels, the scan
+		 * did not finish and must not be reported as a success.
+		 */
+		spin_lock_bh(&ar->data_lock);
+		if (ar->scan.range_req &&
+		    ar->scan.range_next < ar->scan.range_req->num_chan)
+			ar->scan.state = ATH12K_SCAN_ABORTING;
+		spin_unlock_bh(&ar->data_lock);
+
+		ath12k_mac_scan_range_free(ar);
+	}
+
 	spin_lock_bh(&ar->data_lock);
 	ar->scan.arvif = NULL;
 	if (!ar->scan.is_roc) {
@@ -5419,13 +5702,15 @@ work_complete:
 	}
 
 	ar->scan.state = ATH12K_SCAN_IDLE;
+	ar->scan.finish_queued = false;
 	ar->scan_channel = NULL;
 	ar->scan.roc_freq = 0;
 	spin_unlock_bh(&ar->data_lock);
 }
 
 static int ath12k_start_scan(struct ath12k *ar,
-			     struct ath12k_wmi_scan_req_arg *arg)
+			     struct ath12k_wmi_scan_req_arg *arg,
+			     unsigned long timeout)
 {
 	int ret;
 
@@ -5435,7 +5720,7 @@ static int ath12k_start_scan(struct ath12k *ar,
 	if (ret)
 		return ret;
 
-	ret = wait_for_completion_timeout(&ar->scan.started, 1 * HZ);
+	ret = wait_for_completion_timeout(&ar->scan.started, timeout);
 	if (ret == 0) {
 		ret = ath12k_scan_stop(ar);
 		if (ret)
@@ -5634,9 +5919,11 @@ static int ath12k_mac_initiate_hw_scan(struct ieee80211_hw *hw,
 	struct ath12k_link_vif *arvif;
 	struct cfg80211_scan_request *req = &hw_req->req;
 	struct ath12k_wmi_scan_req_arg *arg = NULL;
+	u32 split_freq, max_scan_time;
 	u8 link_id;
 	int ret;
 	int i;
+	bool split_scan = false;
 	bool create = true;
 
 	lockdep_assert_wiphy(hw->wiphy);
@@ -5705,6 +5992,7 @@ static int ath12k_mac_initiate_hw_scan(struct ieee80211_hw *hw,
 		reinit_completion(&ar->scan.completed);
 		ar->scan.state = ATH12K_SCAN_STARTING;
 		ar->scan.is_roc = false;
+		ar->scan.finish_queued = false;
 		ar->scan.arvif = arvif;
 		ret = 0;
 		break;
@@ -5751,7 +6039,42 @@ static int ath12k_mac_initiate_hw_scan(struct ieee80211_hw *hw,
 	for (i = 0; i < arg->num_chan; i++)
 		arg->chan_list[i] = chan_list[i]->center_freq;
 
-	ret = ath12k_start_scan(ar, arg);
+	max_scan_time = arg->max_scan_time;
+	split_freq = ath12k_mac_scan_split_freq(ar);
+	if (split_freq &&
+	    (ath12k_mac_scan_range_count(arg->chan_list, arg->num_chan,
+					 split_freq) < arg->num_chan ||
+	     arvif->is_up))
+		split_scan = true;
+
+	if (split_scan && arvif->is_up)
+		max_scan_time += 2 * arg->min_rest_time * arg->num_chan;
+
+	/* Only an unassociated multi-channel batch is dequeued late; the
+	 * one-channel associated batches are accepted back to back.
+	 */
+	if (split_scan && !arvif->is_up)
+		max_scan_time +=
+			ath12k_mac_scan_range_batches(arg->chan_list,
+						      arg->num_chan,
+						      split_freq) *
+			ATH12K_RANGE_START_SLACK_MSECS;
+
+	if (split_scan) {
+		spin_lock_bh(&ar->data_lock);
+		ar->scan.range_req = arg;
+		ar->scan.range_next = 0;
+		ar->scan.range_split_freq = split_freq;
+		spin_unlock_bh(&ar->data_lock);
+
+		/* Ownership of the request moves to ar->scan.range_req; the
+		 * local pointer must not be freed on the success path.
+		 */
+		arg = NULL;
+		ret = ath12k_mac_scan_range_start(ar);
+	} else {
+		ret = ath12k_start_scan(ar, arg, 1 * HZ);
+	}
 	if (ret) {
 		if (ret == -EBUSY)
 			ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
@@ -5759,8 +6082,12 @@ static int ath12k_mac_initiate_hw_scan(struct ieee80211_hw *hw,
 		else
 			ath12k_warn(ar->ab, "failed to start hw scan: %d\n", ret);
 
+		if (split_scan)
+			ath12k_mac_scan_range_free(ar);
+
 		spin_lock_bh(&ar->data_lock);
 		ar->scan.state = ATH12K_SCAN_IDLE;
+		ar->scan.finish_queued = false;
 		spin_unlock_bh(&ar->data_lock);
 		goto exit;
 	}
@@ -5768,9 +6095,10 @@ static int ath12k_mac_initiate_hw_scan(struct ieee80211_hw *hw,
 	ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac scan started");
 
 	/* Add a margin to account for event/command processing */
-	ieee80211_queue_delayed_work(ath12k_ar_to_hw(ar), &ar->scan.timeout,
-				     msecs_to_jiffies(arg->max_scan_time +
-						      ATH12K_MAC_SCAN_TIMEOUT_MSECS));
+	wiphy_delayed_work_queue(ath12k_ar_to_hw(ar)->wiphy,
+				 &ar->scan.timeout,
+				 msecs_to_jiffies(max_scan_time +
+						  ATH12K_MAC_SCAN_TIMEOUT_MSECS));
 
 exit:
 	if (arg) {
@@ -5855,9 +6183,11 @@ abort:
 			ar = arvif->ar;
 			if (ar->scan.arvif == arvif) {
 				wiphy_work_cancel(hw->wiphy, &ar->scan.vdev_clean_wk);
+				ath12k_mac_scan_range_free(ar);
 				spin_lock_bh(&ar->data_lock);
 				ar->scan.arvif = NULL;
 				ar->scan.state = ATH12K_SCAN_IDLE;
+				ar->scan.finish_queued = false;
 				ar->scan_channel = NULL;
 				ar->scan.roc_freq = 0;
 				spin_unlock_bh(&ar->data_lock);
@@ -5893,7 +6223,7 @@ void ath12k_mac_op_cancel_hw_scan(struct ieee80211_hw *hw,
 
 		ath12k_scan_abort(ar);
 
-		cancel_delayed_work_sync(&ar->scan.timeout);
+		wiphy_delayed_work_cancel(hw->wiphy, &ar->scan.timeout);
 	}
 }
 EXPORT_SYMBOL(ath12k_mac_op_cancel_hw_scan);
@@ -10044,8 +10374,9 @@ static void ath12k_mac_stop(struct ath12k *ar)
 
 	clear_bit(ATH12K_FLAG_CAC_RUNNING, &ar->dev_flags);
 
-	cancel_delayed_work_sync(&ar->scan.timeout);
+	wiphy_delayed_work_cancel(ath12k_ar_to_hw(ar)->wiphy, &ar->scan.timeout);
 	wiphy_work_cancel(ath12k_ar_to_hw(ar)->wiphy, &ar->scan.vdev_clean_wk);
+	ath12k_mac_scan_range_free(ar);
 	cancel_work_sync(&ar->regd_channel_update_work);
 	cancel_work_sync(&ar->regd_update_work);
 	cancel_work_sync(&ar->ab->rfkill_work);
@@ -11048,6 +11379,7 @@ void ath12k_mac_op_remove_interface(struct ieee80211_hw *hw,
 		 */
 		if (ar->scan.arvif == arvif) {
 			wiphy_work_cancel(hw->wiphy, &ar->scan.vdev_clean_wk);
+			ath12k_mac_scan_range_free(ar);
 
 			spin_lock_bh(&ar->data_lock);
 			ar->scan.arvif = NULL;
@@ -11060,6 +11392,7 @@ void ath12k_mac_op_remove_interface(struct ieee80211_hw *hw,
 			}
 
 			ar->scan.state = ATH12K_SCAN_IDLE;
+			ar->scan.finish_queued = false;
 			ar->scan_channel = NULL;
 			ar->scan.roc_freq = 0;
 			spin_unlock_bh(&ar->data_lock);
@@ -13980,7 +14313,7 @@ int ath12k_mac_op_cancel_remain_on_channel(struct ieee80211_hw *hw,
 
 	ath12k_scan_abort(ar);
 
-	cancel_delayed_work_sync(&ar->scan.timeout);
+	wiphy_delayed_work_cancel(hw->wiphy, &ar->scan.timeout);
 	wiphy_work_flush(hw->wiphy, &ar->scan.vdev_clean_wk);
 
 	return 0;
@@ -14060,6 +14393,7 @@ int ath12k_mac_op_remain_on_channel(struct ieee80211_hw *hw,
 		reinit_completion(&ar->scan.on_channel);
 		ar->scan.state = ATH12K_SCAN_STARTING;
 		ar->scan.is_roc = true;
+		ar->scan.finish_queued = false;
 		ar->scan.arvif = arvif;
 		ar->scan.roc_freq = chan->center_freq;
 		ar->scan.roc_notify = true;
@@ -14096,12 +14430,13 @@ int ath12k_mac_op_remain_on_channel(struct ieee80211_hw *hw,
 	arg->scan_f_passive = 1;
 	arg->burst_duration = duration;
 
-	ret = ath12k_start_scan(ar, arg);
+	ret = ath12k_start_scan(ar, arg, 1 * HZ);
 	if (ret) {
 		ath12k_warn(ar->ab, "failed to start roc scan: %d\n", ret);
 
 		spin_lock_bh(&ar->data_lock);
 		ar->scan.state = ATH12K_SCAN_IDLE;
+		ar->scan.finish_queued = false;
 		spin_unlock_bh(&ar->data_lock);
 		return ret;
 	}
@@ -14115,8 +14450,8 @@ int ath12k_mac_op_remain_on_channel(struct ieee80211_hw *hw,
 		return -ETIMEDOUT;
 	}
 
-	ieee80211_queue_delayed_work(hw, &ar->scan.timeout,
-				     msecs_to_jiffies(duration));
+	wiphy_delayed_work_queue(hw->wiphy, &ar->scan.timeout,
+				 msecs_to_jiffies(duration));
 
 	return 0;
 }
@@ -14987,6 +15322,11 @@ static int ath12k_mac_hw_register(struct ath12k_hw *ah)
 	ath12k_mac_setup_mac_address_list(ah, mac_addr);
 	SET_IEEE80211_DEV(hw, ab->dev);
 
+	/* Channels are private copies. Record board limits before registration
+	 * saves orig_flags, so self-managed regulatory updates retain them.
+	 */
+	wiphy_read_of_freq_limits(wiphy);
+
 	ret = ath12k_mac_setup_iface_combinations(ah);
 	if (ret) {
 		ath12k_err(ab, "failed to setup interface combinations: %d\n", ret);
@@ -15253,6 +15593,7 @@ static void ath12k_mac_setup(struct ath12k *ar)
 	ar->num_tx_chains = hweight32(pdev->cap.tx_chain_mask);
 	ar->num_rx_chains = hweight32(pdev->cap.rx_chain_mask);
 	ar->scan.arvif = NULL;
+	ar->scan.finish_queued = false;
 	ar->vdev_id_11d_scan = ATH12K_11D_INVALID_VDEV_ID;
 
 	spin_lock_init(&ar->data_lock);
@@ -15278,7 +15619,7 @@ static void ath12k_mac_setup(struct ath12k *ar)
 	ar->thermal.temperature = 0;
 	ar->thermal.hwmon_dev = NULL;
 
-	INIT_DELAYED_WORK(&ar->scan.timeout, ath12k_scan_timeout_work);
+	wiphy_delayed_work_init(&ar->scan.timeout, ath12k_scan_timeout_work);
 	wiphy_work_init(&ar->scan.vdev_clean_wk, ath12k_scan_vdev_clean_work);
 	INIT_WORK(&ar->regd_channel_update_work, ath12k_regd_update_chan_list_work);
 	INIT_LIST_HEAD(&ar->regd_channel_update_queue);

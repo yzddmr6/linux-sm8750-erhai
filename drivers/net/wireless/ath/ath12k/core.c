@@ -1516,7 +1516,7 @@ void ath12k_core_halt(struct ath12k *ar)
 
 	ath12k_mac_scan_finish(ar);
 	ath12k_mac_peer_cleanup_all(ar);
-	cancel_delayed_work_sync(&ar->scan.timeout);
+	wiphy_delayed_work_cancel(ath12k_ar_to_hw(ar)->wiphy, &ar->scan.timeout);
 	cancel_work_sync(&ar->regd_update_work);
 	cancel_work_sync(&ar->regd_channel_update_work);
 	cancel_work_sync(&ab->rfkill_work);
@@ -1539,6 +1539,7 @@ static void ath12k_core_pre_reconfigure_recovery(struct ath12k_base *ab)
 	struct ath12k *ar;
 	struct ath12k_hw *ah;
 	int i, j;
+	bool scan_tx_paused;
 
 	spin_lock_bh(&ab->base_lock);
 	ab->stats.fw_crash_counter++;
@@ -1555,12 +1556,25 @@ static void ath12k_core_pre_reconfigure_recovery(struct ath12k_base *ab)
 
 		wiphy_lock(ah->hw->wiphy);
 
+		scan_tx_paused = false;
+		for (j = 0; j < ah->num_radio; j++) {
+			ar = &ah->radio[j];
+			if (ar->scan.range_tx_paused) {
+				/* Recovery now owns the TX pause; keep the
+				 * queues stopped until the normal recovery
+				 * wake.
+				 */
+				ar->scan.range_tx_paused = false;
+				scan_tx_paused = true;
+			}
+		}
+
 		/* If queue 0 is stopped, it is safe to assume that all
 		 * other queues are stopped by driver via
 		 * ieee80211_stop_queues() below. This means, there is
 		 * no need to stop it again and hence continue
 		 */
-		if (ieee80211_queue_stopped(ah->hw, 0)) {
+		if (ieee80211_queue_stopped(ah->hw, 0) && !scan_tx_paused) {
 			wiphy_unlock(ah->hw->wiphy);
 			continue;
 		}
