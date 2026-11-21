@@ -36,6 +36,20 @@
 	};
 
 	reserved-memory {
+		/*
+		 * ABL leaves DPU scanning out the 3392x2400 framebuffer at
+		 * 0xfc800000 until drm/msm tears down bootloader scanout.
+		 * Match the stock splash_region reservation (0xfc800000,
+		 * 0x2b00000) so Linux does not place global CMA (0xfcc00000)
+		 * or adsp-rpc-remote-heap inside the active scanout range,
+		 * where qcom_scm_pas_init_image() metadata allocations get
+		 * XPU-locked by TZ and reset the SoC on DPU/efifb access.
+		 */
+		splash_mem: splash@fc800000 {
+			reg = <0x0 0xfc800000 0x0 0x2b00000>;
+			no-map;
+		};
+
 		ramoops@afff00000 {
 			compatible = "ramoops";
 			reg = <0xa 0xfff00000 0x0 0x100000>;
